@@ -1,137 +1,204 @@
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
-import time
+import argparse
+import asyncio
+import csv
+import logging
+from concurrent.futures import ProcessPoolExecutor
 import datetime
-import pandas as pd
+from multiprocessing import cpu_count
 from nltk.tokenize import sent_tokenize
-from tqdm import tqdm
-from tqdm import trange
-import nltk
-from urllib3 import disable_warnings, exceptions
+import aiohttp
+from bs4 import BeautifulSoup
+import ssl
+import certifi
 
-disable_warnings(exceptions.InsecureRequestWarning)
-
+# import nltk
 # nltk.download('punkt')
 
-start_time = datetime.datetime.now()
-
-HEADERS = {
-    'Connection': 'keep-alive',
-    'Cache-Control': 'max-age=0',
-    'Upgrade-Insecure-Requests': '1',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.116 Safari/537.36 OPR/40.0.2308.81',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'DNT': '1',
-    'Accept-Encoding': 'gzip, deflate, lzma, sdch',
-    'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4'
-}
-
-MAX_RETRIES = 20
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s @ %(message)s",
+    datefmt="%d-%m-%Y %H:%M:%S",
+)
+logger = logging.getLogger(name="RiaAgencyParser")
 
 
 class RiaAgencyParser:
+    # lxml is much faster but error prone
+    default_parser = "html.parser"
 
-    def __init__(self):
-        self.session = self.create_session()
+    def __init__(self, *, max_workers: int, outfile_name: str, from_date: str, to_date: str):
+        self._endpoint = "https://ria.ru/"
 
-    def create_session(self):
-        session = requests.Session()
-        retries = Retry(total=MAX_RETRIES, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount('https://', adapter)
-        session.mount('https://', adapter)
-        return session
+        self._sess = None
+        self._connector = None
 
-    def get_html_pages(self, article_url: str, start_date: str, end_date: str):
-        start_date = datetime.datetime.strptime(start_date, "%Y.%m.%d").date()
-        end_date = datetime.datetime.strptime(end_date, "%Y.%m.%d").date()
-        current_date = start_date
-        pages = []
-        total_days = (end_date - start_date).days + 1
-        with tqdm(total=total_days, desc="Processing Archive by Dates") as pbar:
-            while current_date <= end_date:
-                date_str = current_date.strftime("%Y%m%d")
-                news_page_url = f"{article_url}/{date_str}"
-                response = self.session.get(news_page_url, headers=HEADERS, verify=False)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                links = soup.find_all("a", {"class": "list-item__title"})
-                for href in links:
-                    pages.append(href.get("href"))
+        self._executor = ProcessPoolExecutor(max_workers=max_workers)
 
-                time.sleep(5)
-                pbar.update(1)
-                current_date += datetime.timedelta(days=1)
+        self._outfile_name = outfile_name
+        self._outfile = None
+        self._csv_writer = None
+        self.timeouts = aiohttp.ClientTimeout(total=60, connect=60)
+        self._sslcontext = ssl.create_default_context(cafile=certifi.where())
 
-        return pages
+        self._n_downloaded = 0
+        self._from_date = datetime.datetime.strptime(from_date, "%Y.%m.%d").date()
+        self._to_date = datetime.datetime.strptime(to_date, "%Y.%m.%d").date()
 
-    def extract_info_from_pages(self, articles: list):
-        titles = []
-        dates = []
-        texts = []
-        for i in (pbar := trange(len(articles))):
-            pbar.set_description("Parsing html pages")
-            response = self.session.get(url=articles[i], headers=HEADERS, verify=False)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            if soup.find(["div", "h1"], attrs={"class": "article__title"}):
-                title = soup.find(["div", "h1"], attrs={"class": "article__title"}).text
+    @property
+    def dates_countdown(self):
+        date_start = self._from_date
+        date_end = self._to_date
+
+        while date_start <= date_end:
+            yield date_start.strftime("%Y%m%d")
+            date_start += datetime.timedelta(days=1)
+
+    @property
+    def writer(self):
+        if self._csv_writer is None:
+            self._outfile = open(self._outfile_name, "w", 1, encoding='utf-8')
+            self._csv_writer = csv.DictWriter(
+                self._outfile, fieldnames=["url", "title", 'date', "text"]
+            )
+            self._csv_writer.writeheader()
+
+        return self._csv_writer
+
+    async def fetch(self, url: str):
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(
+                use_dns_cache=True, ttl_dns_cache=60 * 60, limit=1024),
+                timeout=self.timeouts) as session:
+            async with session.get(url, ssl=self._sslcontext) as response:
+                return await response.text()
+
+    @staticmethod
+    def parse_article_html(html: str):
+        doc_tree = BeautifulSoup(html, "html.parser")
+        if doc_tree.find(["div", "h1"], attrs={"class": "article__title"}):
+            title = doc_tree.find(["div", "h1"], attrs={"class": "article__title"}).text
+        else:
+            title = None
+
+        if doc_tree.findAll("div", class_="article__text"):
+            text = ' '.join([i.text for i in doc_tree.findAll("div", class_="article__text")])
+            sents = sent_tokenize(text)
+            text = ' '.join(sents[1:])
+        else:
+            text = None
+
+        if doc_tree.find("div", class_="article__info-date").find("a"):
+            date_element = doc_tree.find("div", class_="article__info-date").find("a")
+            date_text = date_element.text.strip()
+            date_time = date_text.split()
+            date_part = date_time[1]
+        else:
+            date_part = None
+
+        return {"title": title, "date": date_part, "text": text}
+
+    @staticmethod
+    def _extract_urls_from_html(html: str):
+        doc_tree = BeautifulSoup(html, "html.parser")
+        news_list = doc_tree.find_all("a", {"class": "list-item__title"})
+        return tuple(news.get("href") for news in news_list)
+
+    async def _fetch_all_news_on_page(self, initial_html: str):
+        news_urls = []
+        html = initial_html
+        page_news_urls = await asyncio.to_thread(self._extract_urls_from_html, html)
+        news_urls.extend(page_news_urls)
+
+        tasks = [asyncio.create_task(self.fetch(url)) for url in set(news_urls)]
+        fetched_raw_news = {}
+        for i, task in enumerate(tasks):
+            try:
+                fetch_res = await task
+            except aiohttp.ClientResponseError as exc:
+                logger.error(f"Cannot fetch {exc.request_info.url}: {exc}")
+            except asyncio.TimeoutError:
+                logger.exception("Cannot fetch. Timeout")
             else:
-                title = None
+                fetched_raw_news[news_urls[i]] = fetch_res
 
-            if soup.findAll("div", class_="article__text"):
-                text = ' '.join([i.text for i in soup.findAll("div", class_="article__text")])
-                sents = sent_tokenize(text)
-                text = ' '.join(sents[1:])
+        parse_tasks = {url: asyncio.to_thread(self.parse_article_html, html) for url, html in fetched_raw_news.items()}
+        parsed_news = []
+
+        for url, task in parse_tasks.items():
+            try:
+                parse_res = await task
+            except Exception as e:
+                logger.exception(f"Cannot parse {url}: {e}")
             else:
-                text = None
+                parse_res["url"] = url
+                parsed_news.append(parse_res)
 
-            if soup.find("div", class_="article__info-date").find("a"):
-                date_element = soup.find("div", class_="article__info-date").find("a")
-                date_text = date_element.text.strip()
-                date_time = date_text.split()
-                date_part = date_time[1]
+        if parsed_news:
+            self.writer.writerows(parsed_news)
+            self._n_downloaded += len(parsed_news)
+
+        return len(parsed_news)
+
+    async def _producer(self):
+        for date in self.dates_countdown:
+            news_page_url = f"{self._endpoint}/{date}"
+
+            try:
+                html = await asyncio.create_task(self.fetch(news_page_url))
+            except aiohttp.ClientResponseError:
+                logger.exception(f"Cannot fetch {news_page_url}")
+            except aiohttp.ClientConnectionError:
+                logger.exception(f"Cannot fetch {news_page_url}")
+            except BaseException as e:
+                logger.info(f"Cannot fetch {news_page_url}: {e}")
             else:
-                date_part = None
+                n_proccessed_news = await self._fetch_all_news_on_page(html)
 
-            titles.append(title)
-            dates.append(date_part)
-            texts.append(text)
-            time.sleep(5)
+                if n_proccessed_news == 0:
+                    logger.info(f"News not found at {news_page_url}.")
 
-        return titles, dates, texts
+                logger.info(
+                    f"{news_page_url} processed ({n_proccessed_news} news). "
+                    f"{self._n_downloaded} news saved totally."
+                )
 
-    def save_to_csv(self, titles: list, dates: list, texts: list,
-                    file_name: str):
-        ria_news_dataset = pd.DataFrame(list(zip(titles, dates, texts)), columns=['title', 'date', 'text'])
-        ria_news_dataset.to_csv(f"{file_name}.csv", index=False, encoding='utf-8')
+    async def run(self):
+        await self._producer()
 
-    def main(self):
-        start_date = "2024.05.01"
-        end_date = "2024.05.02"
 
-        url = "https://ria.ru/"
-        file_name = 'ria-2016-2019'
-        parser = RiaAgencyParser()
+def main():
+    parser = argparse.ArgumentParser(description="Downloads news from Lenta.Ru")
 
-        print('Starting the process...')
-        articles = parser.get_html_pages(url, start_date, end_date)
-        print(len(articles))
-        print('The links are downloaded')
-        print('Extracting info from each article page...')
-        titles, dates, texts = parser.extract_info_from_pages(articles)
-        print(len(titles))
-        print(len(dates))
-        print(len(texts))
-        print('The information has been saved')
-        saving_results = parser.save_to_csv(titles, dates, texts, file_name)
-        print('The results are saved.')
-        print()
+    parser.add_argument(
+        "--outfile", default="ria-agency-news.csv", help="name of result file"
+    )
+
+    parser.add_argument(
+        "--cpu-workers", default=cpu_count(), type=int, help="number of workers"
+    )
+
+    parser.add_argument(
+        "--from-date",
+        default="2013.01.01",
+        type=str,
+        help="download news from this date. Example: 2024.05.01",
+    )
+    parser.add_argument(
+        "--to-date",
+        default="2023.12.32",
+        type=str,
+        help="download news from this date. Example: 2024.05.03",
+    )
+    args = parser.parse_args()
+
+    parser = RiaAgencyParser(
+        max_workers=args.cpu_workers,
+        outfile_name=args.outfile,
+        from_date=args.from_date,
+        to_date=args.to_date
+    )
+
+    asyncio.run(parser.run())
 
 
 if __name__ == "__main__":
-    ria = RiaAgencyParser()
-    ria.main()
-
-end_time = datetime.datetime.now()
-print('Duration: {}'.format(end_time - start_time))
+    main()
