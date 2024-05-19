@@ -11,8 +11,6 @@ from bs4 import BeautifulSoup
 import ssl
 import certifi
 
-# import nltk
-# nltk.download('punkt')
 
 logging.basicConfig(
     level=logging.DEBUG,
