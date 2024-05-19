@@ -12,6 +12,7 @@ import ssl
 import certifi
 
 
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s @ %(message)s",
@@ -21,7 +22,6 @@ logger = logging.getLogger(name="RiaAgencyParser")
 
 
 class RiaAgencyParser:
-    # lxml is much faster but error prone
     default_parser = "html.parser"
 
     def __init__(self, *, max_workers: int, outfile_name: str, from_date: str, to_date: str):
